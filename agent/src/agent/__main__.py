@@ -84,7 +84,7 @@ async def run_live() -> None:
     )
     from core import start_stream
 
-    from agent.prompt import analyze
+    from agent.prompt import analyze, set_last_result
 
     print("=" * 50)
     print("  LIVE MODE")
@@ -152,6 +152,7 @@ async def run_live() -> None:
                     continue
 
                 guess_count += 1
+                set_last_result(guess, result.correct)
                 id_suffix = f" id={result.guess_id}" if result.guess_id is not None else ""
                 print(f"  [guess #{guess_count}{id_suffix}] {guess}")
 
