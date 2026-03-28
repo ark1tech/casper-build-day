@@ -31,8 +31,8 @@ def _detect_ffmpeg() -> str:
     )
 
 
-def _build_capture_cmd(ffmpeg: str, camera_index: int) -> list[str]:
-    """Build a platform-appropriate ffmpeg command for single-frame capture."""
+def _camera_input_args(camera_index: int) -> tuple[list[str], str]:
+    """Return (ffmpeg input option list, device string) for the local camera."""
     system = platform.system()
 
     if system == "Linux":
@@ -49,6 +49,12 @@ def _build_capture_cmd(ffmpeg: str, camera_index: int) -> list[str]:
         input_fmt = ["-f", "v4l2"]
         device = f"/dev/video{camera_index}"
 
+    return input_fmt, device
+
+
+def _build_probe_cmd(ffmpeg: str, camera_index: int) -> list[str]:
+    """Single-frame probe to validate the device and learn frame dimensions."""
+    input_fmt, device = _camera_input_args(camera_index)
     return [
         ffmpeg,
         "-hide_banner", "-loglevel", "error",
@@ -59,6 +65,46 @@ def _build_capture_cmd(ffmpeg: str, camera_index: int) -> list[str]:
         "-vcodec", "rawvideo",
         "pipe:1",
     ]
+
+
+def _build_stream_cmd(ffmpeg: str, camera_index: int, output_fps: int) -> list[str]:
+    """Continuous raw RGB stream at ``output_fps`` — keeps the camera open."""
+    input_fmt, device = _camera_input_args(camera_index)
+    fps = max(1, output_fps)
+    return [
+        ffmpeg,
+        "-hide_banner", "-loglevel", "error",
+        *input_fmt,
+        "-i", device,
+        "-vf", f"fps={fps}",
+        "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "-vcodec", "rawvideo",
+        "pipe:1",
+    ]
+
+
+async def _read_exact(stream: asyncio.StreamReader, n: int) -> bytes:
+    """Read exactly ``n`` bytes from a stream (async)."""
+    chunks: list[bytes] = []
+    remaining = n
+    while remaining > 0:
+        chunk = await stream.read(remaining)
+        if not chunk:
+            raise RuntimeError(f"EOF after {n - remaining} of {n} bytes")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+async def _drain_stderr(stream: asyncio.StreamReader) -> None:
+    """Consume stderr so a long-running ffmpeg process does not block."""
+    try:
+        while True:
+            chunk = await stream.read(4096)
+            if not chunk:
+                break
+    except Exception:
+        pass
 
 
 async def _capture_one_frame(cmd: list[str]) -> Image.Image:
@@ -102,8 +148,6 @@ async def start_practice(
     Yields:
         Frame objects with a PIL Image and timestamp.
     """
-    interval = 1.0 / fps
-
     print(f"[practice] Opening camera {camera_index}...")
     print(f"[practice] Sampling at {fps} FPS. Press Ctrl+C to stop.\n")
 
@@ -113,30 +157,58 @@ async def start_practice(
         print(f"[!] {exc}")
         return
 
-    cmd = _build_capture_cmd(ffmpeg, camera_index)
+    probe_cmd = _build_probe_cmd(ffmpeg, camera_index)
 
     try:
-        test_frame = await _capture_one_frame(cmd)
-        print(f"[practice] Camera {camera_index} ready "
-              f"({test_frame.size[0]}x{test_frame.size[1]}).\n")
+        test_frame = await _capture_one_frame(probe_cmd)
     except Exception as exc:
         print(f"[!] Could not capture from camera {camera_index}: {exc}")
         return
 
-    while True:
-        try:
-            image = await _capture_one_frame(cmd)
+    w, h = test_frame.size
+    frame_bytes = w * h * 3
 
+    stream_cmd = _build_stream_cmd(ffmpeg, camera_index, fps)
+    proc = await asyncio.create_subprocess_exec(
+        *stream_cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    assert proc.stdout is not None
+    assert proc.stderr is not None
+
+    stderr_task = asyncio.create_task(_drain_stderr(proc.stderr))
+
+    print(
+        f"[practice] Camera {camera_index} streaming "
+        f"({w}x{h}) — one ffmpeg process, camera stays on.\n"
+    )
+
+    try:
+        while True:
+            try:
+                raw = await _read_exact(proc.stdout, frame_bytes)
+            except KeyboardInterrupt:
+                print("\n[practice] Stopped.")
+                break
+            except Exception as exc:
+                print(f"[practice] Error capturing frame: {exc}")
+                break
+
+            image = Image.frombytes("RGB", (w, h), raw)
             yield Frame(
                 image=image,
                 timestamp=datetime.now(timezone.utc),
             )
-
-            await asyncio.sleep(interval)
-
-        except KeyboardInterrupt:
-            print("\n[practice] Stopped.")
-            break
-        except Exception as exc:
-            print(f"[practice] Error capturing frame: {exc}")
-            break
+    finally:
+        proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
+        except TimeoutError:
+            proc.kill()
+            await proc.wait()
+        stderr_task.cancel()
+        try:
+            await stderr_task
+        except asyncio.CancelledError:
+            pass

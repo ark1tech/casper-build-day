@@ -61,12 +61,16 @@ async def run_practice(camera: int, fps: int) -> None:
     print("=" * 50)
     print()
 
-    async for frame in start_practice(camera_index=camera, fps=fps):
-        guess = await analyze(frame)
-        if guess:
-            print(f"  [guess] {guess}")
-        else:
-            print("  [skip]  No guess this frame")
+    practice = start_practice(camera_index=camera, fps=fps)
+    try:
+        async for frame in practice:
+            guess = await analyze(frame)
+            if guess:
+                print(f"  [guess] {guess}")
+            else:
+                print("  [skip]  No guess this frame")
+    finally:
+        await practice.aclose()
 
 
 async def run_live() -> None:
