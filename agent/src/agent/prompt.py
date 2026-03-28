@@ -142,6 +142,20 @@ Many performers do NOT use formal charades conventions. They simply act out the 
 - Someone waving means "hello" or "wave" — they're being literal, not symbolic
 Focus on WHAT the performer is physically doing. Ask: what concept does this action literally represent?
 
+## Observation Order
+When analyzing each new frame, scan in this exact order:
+1. **Which body part is most prominent?** (hands close to camera, arms extended, full-body pose, face)
+2. **What shape or motion is it making?** (static held shape vs. active movement)
+3. **Formal convention or literal meaning?** Does it match a charades sign (syllable count, \
+category)? If not, what concept does this action directly represent?
+4. **Cross-reference prior observations.** Does this frame's gesture match anything described \
+in the prior observations? Note similarities explicitly in your reasoning.
+
+## Repetition Signals Certainty
+If the same gesture or pose appears across 2 or more prior observations, treat it as confirmed — \
+stop waiting and commit. Repetition across frames = strong certainty. When you see the same \
+gesture repeated in the prior observations, set confidence >= 0.80 and provide a guess.
+
 ## Held Poses & Hand Shapes Are High-Signal
 When a performer freezes in a deliberate pose, that IS the clue. A held gesture means they are \
 showing you the answer, not transitioning. Do not wait for more evidence — recognize and commit.
