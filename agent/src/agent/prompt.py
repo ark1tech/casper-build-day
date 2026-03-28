@@ -18,9 +18,12 @@ Scoring model reminder
 
 from __future__ import annotations
 
+import asyncio
 import io
 import os
+import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
@@ -37,6 +40,7 @@ from core import Frame
 # Rate limiter — prevents concurrent LLM calls and caps token spend
 _MIN_CALL_INTERVAL_S: float = 1.5   # max ~0.67 LLM calls/sec
 _FIRST_N_ALWAYS: int = 3            # always call LLM for first N frames
+_LLM_TIMEOUT_S: float = 15.0       # hard timeout per LLM call
 
 # Phase boundaries (seconds elapsed)
 _PHASE_OBSERVE_END: float = 3.0
@@ -48,6 +52,19 @@ _CONF_AGGRESSIVE: float = 0.45
 
 # Context window
 _MAX_CONTEXT_OBS: int = 8
+
+# Debug mode — set DEBUG_FRAMES=1 env var to save every analyzed frame to disk
+_DEBUG_FRAMES: bool = os.environ.get("DEBUG_FRAMES", "").strip() in ("1", "true", "yes")
+_DEBUG_DIR: Path | None = None
+
+
+def _get_debug_dir() -> Path:
+    global _DEBUG_DIR
+    if _DEBUG_DIR is None:
+        _DEBUG_DIR = Path("debug_frames")
+        _DEBUG_DIR.mkdir(exist_ok=True)
+        print(f"  [debug] Saving analyzed frames to {_DEBUG_DIR.resolve()}")
+    return _DEBUG_DIR
 
 # ---------------------------------------------------------------------------
 # Structured output schema
@@ -113,7 +130,7 @@ book open in hands = "it's a book/movie"; fingers as quotation marks = exact phr
 - **Word count**: holding up N fingers = N-word phrase
 - **Which word**: holding up N fingers after word-count = working on the Nth word
 - **Small word**: pinching fingers together = a short/small word (the, a, and, in…)
-- **Longer/shorter**: stretching hands apart or bringing together = longer or shorter guess
+- **Longer/shorter**: stretching hands apart or bringing together = make the guess longer or shorter
 - **Action verbs**: miming a physical activity (swimming, flying, eating) → the word IS \
 that verb or strongly related to it
 - **Compound words**: performer may act out each part separately
@@ -125,9 +142,21 @@ Many performers do NOT use formal charades conventions. They simply act out the 
 - Someone waving means "hello" or "wave" — they're being literal, not symbolic
 Focus on WHAT the performer is physically doing. Ask: what concept does this action literally represent?
 
-## Held Poses Are High-Signal
+## Held Poses & Hand Shapes Are High-Signal
 When a performer freezes in a deliberate pose, that IS the clue. A held gesture means they are \
 showing you the answer, not transitioning. Do not wait for more evidence — recognize and commit.
+
+Pay special attention when the performer holds their hands still in front of the camera:
+- They are deliberately forming a SHAPE with their hands for you to read. Study the exact \
+finger positions, gaps between fingers, and overall silhouette.
+- Common hand shapes: heart (two hands forming a heart), gun/pistol (finger gun), \
+binoculars (circles over eyes), camera (framing rectangle), butterfly (interlocked thumbs \
+with spread fingers), phone (thumb + pinky extended), OK sign, thumbs up/down, \
+antlers/horns, shadow puppet animals, letters of the alphabet (ASL or finger spelling).
+- If the hands are cupped, curved, or arranged into an outline, ask: what OBJECT or SYMBOL \
+does this silhouette resemble? The answer is often the shape itself or what the shape represents.
+- Stillness is emphasis — the longer they hold it, the more certain they are that the shape \
+IS the answer. Treat a frozen hand shape as the strongest single-frame signal you can get.
 
 ## Answer Complexity
 Answers are NOT always simple nouns. They may be:
@@ -137,8 +166,32 @@ Answers are NOT always simple nouns. They may be:
 - Abstract concepts ("freedom", "nostalgia")
 - Verbs or gerunds ("skydiving", "negotiating")
 
+## Strategy
+- Accumulate evidence across frames before guessing. One frame is rarely enough.
+- If you see a syllable or word-count gesture, factor it into every future guess.
+- Prefer a specific, concrete answer over a vague one (e.g. "Titanic" > "ship movie").
+- If uncertain between two options, output null and wait for more frames.
+
+## Handling Wrong Guesses
+When you see prior wrong guesses in the context, use them as signal:
+- A wrong single-word guess might mean the answer is a PHRASE containing that word \
+(e.g. "swimming" was wrong → try "swimming upstream" or "keep swimming").
+- A wrong phrase might mean you have the right idea but wrong wording \
+(e.g. "leap of faith" was wrong → try "take a leap" or "blind faith").
+- If multiple similar guesses were all wrong, PIVOT to a completely different interpretation.
+- Consider that the performer may be acting out syllables or "sounds like" — the answer may \
+be phonetically related, not literally what they are miming.
+- Each guess costs points. Do NOT submit a variation unless you have new visual evidence.
+
+## Scoring & Live Mode
+Your score = guesses_remaining * speed_bonus. This means:
+- Every wrong guess directly reduces your score — be selective, not trigger-happy.
+- Faster correct answers earn a higher speed bonus — don't overthink when evidence is clear.
+- You have a maximum of 10 guesses per round. If you hit the limit (HTTP 429), the round is over.
+- Balance urgency against accuracy: commit quickly on strong evidence, hold back on weak evidence.
+
 ## Confidence Calibration
-- If the visual evidence is unambiguous, set confidence >= 0.80.
+- If the visual evidence is unambiguous (clear held pose, obvious mime), set confidence >= 0.80.
 - If you are reasonably sure but could imagine 1-2 other answers, set 0.60-0.79.
 - If you are genuinely uncertain, output null guess and confidence < 0.50.
 - Do NOT artificially suppress confidence. If you can read the gesture clearly, say so.
@@ -148,7 +201,8 @@ You MUST respond with valid JSON matching the FrameAnalysis schema.
 - `observation`: what you see in THIS frame (precise about body parts and gestures)
 - `reasoning`: synthesize ALL prior observations + this frame to build toward the answer
 - `guess`: your best answer right now, or null if not confident enough
-- `confidence`: 0.0-1.0; commit above 0.70 when evidence is clear
+- `confidence`: 0.0-1.0; exceed 0.60 when evidence reasonably supports your guess, \
+commit above 0.70 when evidence is clear
 """
 
 # ---------------------------------------------------------------------------
@@ -186,6 +240,7 @@ _wrong_guesses: list[str] = []        # confirmed 409 from judge
 _round_solved: bool = False
 _last_llm_call_s: float = -999.0      # for rate limiter
 _frame_count: int = 0
+_wall_start: float | None = None      # monotonic clock at round start
 
 
 # ---------------------------------------------------------------------------
@@ -276,17 +331,36 @@ async def analyze(frame: Frame) -> str | None:
     Called by the main loop for every sampled frame. Coordinates the rate
     limiter, unified LLM agent, and phase-gated arbiter.
     """
-    global _round_start, _last_llm_call_s, _frame_count
+    global _round_start, _last_llm_call_s, _frame_count, _wall_start
 
     if _round_solved:
         return None
 
     now = frame.timestamp
+    wall_now = time.monotonic()
+
     if _round_start is None:
         _round_start = now
+        _wall_start = wall_now
 
     elapsed_s = (now - _round_start).total_seconds()
+    wall_elapsed = wall_now - _wall_start if _wall_start else 0.0
     _frame_count += 1
+
+    # Detect frame staleness (frame timestamp vs wall clock drift)
+    drift = abs(wall_elapsed - elapsed_s)
+    if drift > 3.0:
+        print(
+            f"  [agent] WARNING: frame drift={drift:.1f}s "
+            f"(wall={wall_elapsed:.1f}s, frame_ts={elapsed_s:.1f}s) — "
+            f"frame may be stale"
+        )
+
+    print(
+        f"  [agent] Frame #{_frame_count} | "
+        f"elapsed={elapsed_s:.1f}s | wall={wall_elapsed:.1f}s | "
+        f"size={frame.image.size}"
+    )
 
     # ------------------------------------------------------------------ #
     # 1. Rate limiter — skip if last LLM call was too recent
@@ -295,7 +369,16 @@ async def analyze(frame: Frame) -> str | None:
         return None
 
     # ------------------------------------------------------------------ #
-    # 2. Build context string
+    # 2. Save debug frame to disk (if DEBUG_FRAMES=1)
+    # ------------------------------------------------------------------ #
+    if _DEBUG_FRAMES:
+        debug_dir = _get_debug_dir()
+        debug_path = debug_dir / f"frame_{_frame_count:04d}_t{elapsed_s:.1f}s.jpg"
+        frame.image.save(str(debug_path), format="JPEG", quality=90)
+        print(f"  [debug] Saved {debug_path.name}")
+
+    # ------------------------------------------------------------------ #
+    # 3. Build context string
     # ------------------------------------------------------------------ #
     context_parts: list[str] = [
         f"Round elapsed: {elapsed_s:.1f}s | Guesses used: {len(_submitted_guesses)}/10"
@@ -326,7 +409,7 @@ async def analyze(frame: Frame) -> str | None:
     user_context = "\n\n".join(context_parts)
 
     # ------------------------------------------------------------------ #
-    # 3. Convert PIL Image → JPEG bytes
+    # 4. Convert PIL Image → JPEG bytes
     # ------------------------------------------------------------------ #
     buf = io.BytesIO()
     img = frame.image
@@ -336,22 +419,34 @@ async def analyze(frame: Frame) -> str | None:
     jpeg_bytes = buf.getvalue()
 
     # ------------------------------------------------------------------ #
-    # 4. Call unified LLM agent
+    # 5. Call unified LLM agent (with timeout)
     # ------------------------------------------------------------------ #
     _last_llm_call_s = elapsed_s
+    llm_start = time.monotonic()
 
     try:
-        result = await _get_agent().run(
-            [user_context, BinaryContent(data=jpeg_bytes, media_type="image/jpeg")],
-            output_type=FrameAnalysis,
+        result = await asyncio.wait_for(
+            _get_agent().run(
+                [user_context, BinaryContent(data=jpeg_bytes, media_type="image/jpeg")],
+                output_type=FrameAnalysis,
+            ),
+            timeout=_LLM_TIMEOUT_S,
         )
         analysis: FrameAnalysis = result.output
+    except asyncio.TimeoutError:
+        llm_dur = time.monotonic() - llm_start
+        print(f"  [agent] LLM TIMEOUT after {llm_dur:.1f}s — skipping frame")
+        return None
     except Exception as exc:
-        print(f"  [agent] LLM error: {exc}")
+        llm_dur = time.monotonic() - llm_start
+        print(f"  [agent] LLM error after {llm_dur:.1f}s: {exc}")
         return None
 
+    llm_dur = time.monotonic() - llm_start
+    print(f"  [agent] LLM responded in {llm_dur:.1f}s")
+
     # ------------------------------------------------------------------ #
-    # 5. Record observation
+    # 6. Record observation
     # ------------------------------------------------------------------ #
     _frame_observations.append(f"t={elapsed_s:.1f}s: {analysis.observation}")
     if len(_frame_observations) > 15:
