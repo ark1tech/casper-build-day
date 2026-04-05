@@ -11,19 +11,29 @@ from PIL import Image
 
 from core.frame import Frame
 
-# Match default practice sampling (~1 FPS).
-_MIN_FRAME_INTERVAL_S = 1.0
-
 # Wait for admin (or any remote) to publish camera video.
 _FIRST_FRAME_TIMEOUT_S = 120.0
 
 
-async def start_stream(url: str, token: str) -> AsyncIterator[Frame]:
+def _min_frame_interval_s(fps: float) -> float:
+    """Seconds between yielded frames (higher fps → more temporal variety for the agent)."""
+    f = max(0.5, min(30.0, float(fps)))
+    return 1.0 / f
+
+
+async def start_stream(
+    url: str,
+    token: str,
+    *,
+    fps: float = 3.0,
+) -> AsyncIterator[Frame]:
     """Connect to a LiveKit room and yield video frames from remote participants.
 
     Args:
         url: The LiveKit server URL (e.g. wss://project.livekit.cloud).
         token: A subscribe-only JWT token from GET /api/feed.
+        fps: Target sampling rate for yielded frames (default 3). Higher values give the agent
+            more distinct moments; very high values increase CPU load.
 
     Yields:
         Frame objects with a PIL Image (RGB) and timestamp.
@@ -32,7 +42,9 @@ async def start_stream(url: str, token: str) -> AsyncIterator[Frame]:
         ConnectionError: If no remote video track appears within the timeout.
     """
     from livekit import rtc
-    from livekit.rtc import TrackKind, VideoBufferType
+    from livekit.rtc import TrackKind
+
+    min_interval_s = _min_frame_interval_s(fps)
 
     room = rtc.Room()
     video_streams: list[rtc.VideoStream] = []
@@ -48,7 +60,9 @@ async def start_stream(url: str, token: str) -> AsyncIterator[Frame]:
         started_track_sids.add(track.sid)
         vs = rtc.VideoStream(track)
         video_streams.append(vs)
-        pump_tasks.append(asyncio.create_task(_pump_video_to_queue(vs, frame_queue)))
+        pump_tasks.append(
+            asyncio.create_task(_pump_video_to_queue(vs, frame_queue, min_interval_s))
+        )
 
     @room.on("track_subscribed")
     def _on_track_subscribed(
@@ -97,7 +111,11 @@ async def start_stream(url: str, token: str) -> AsyncIterator[Frame]:
         await room.disconnect()
 
 
-async def _pump_video_to_queue(stream, queue: asyncio.Queue[Frame]) -> None:
+async def _pump_video_to_queue(
+    stream,
+    queue: asyncio.Queue[Frame],
+    min_interval_s: float,
+) -> None:
     from livekit.rtc import VideoBufferType
 
     last_emit_monotonic: float | None = None
@@ -106,7 +124,7 @@ async def _pump_video_to_queue(stream, queue: asyncio.Queue[Frame]) -> None:
             now_m = time.monotonic()
             if (
                 last_emit_monotonic is not None
-                and now_m - last_emit_monotonic < _MIN_FRAME_INTERVAL_S
+                and now_m - last_emit_monotonic < min_interval_s
             ):
                 continue
             vf = event.frame

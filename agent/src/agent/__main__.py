@@ -43,8 +43,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fps",
         type=int,
-        default=1,
-        help="Frames per second to sample (default: 1)",
+        default=3,
+        help="Frames per second to sample — practice camera and live stream (default: 3)",
     )
     return parser.parse_args()
 
@@ -73,7 +73,7 @@ async def run_practice(camera: int, fps: int) -> None:
         await practice.aclose()
 
 
-async def run_live() -> None:
+async def run_live(fps: int) -> None:
     """Run the agent in live mode against the game server."""
     from api import (
         CasperAPI,
@@ -113,7 +113,11 @@ async def run_live() -> None:
     guess_count = 0
 
     try:
-        async for frame in start_stream(feed.livekit_url, feed.token):
+        async for frame in start_stream(
+            feed.livekit_url,
+            feed.token,
+            fps=float(max(1, fps)),
+        ):
             guess = await analyze(frame)
 
             if guess:
@@ -178,7 +182,7 @@ async def main() -> None:
     if args.practice:
         await run_practice(camera=args.camera, fps=args.fps)
     else:
-        await run_live()
+        await run_live(fps=args.fps)
 
 
 if __name__ == "__main__":
